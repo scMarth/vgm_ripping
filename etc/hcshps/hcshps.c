@@ -20,6 +20,7 @@ enum prog_mode
     MODE_BUILD,
     MODE_EXTRACT,
     MODE_EXAMINE,
+    MODE_FIXDECSTATES,
 };
 
 struct DSP_decode_state
@@ -40,14 +41,18 @@ struct channel_info
 
 static void extract(const char *brstm_name, const char *dsp_names [],
         int dsp_count);
+static void fixdecstates(const char *brstm_name, const char *dsp_names [],
+        int dsp_count);
 static void build(const char *brstm_name, const char *dsp_names [],
         int dsp_count);
-static uint32_t samples_to_nibbles(uint32_t samples);
+//static uint32_t samples_to_nibbles(uint32_t samples);
 static uint32_t nibbles_to_samples(uint32_t nibbles);
 void decode_dsp_nowhere(struct DSP_decode_state *state, long start_offset, uint32_t start_nibble, uint32_t end_nibble, FILE *infile);
-
+void print_block_data(long block_offset, uint32_t block_size_total, FILE *infile, FILE *outfile);
+/*
 static void expect_8(uint8_t expected, long offset, const char *desc,
         FILE *infile);
+*/
 static void expect_16(uint16_t expected, long offset, const char *desc,
         FILE *infile);
 static void expect_32(uint32_t expected, long offset, const char *desc,
@@ -67,8 +72,12 @@ static void usage(void)
             "    %s --build dest.hps source.dsp [sourceR.dsp]\n"
             "extract usage:\n"
             "    %s --extract source.hps dest.dsp [destR.dsp]\n"
+            "\n"
+            "Fix decoder states in headers based on audio data:\n"
+            "fixdecstates usage:\n"
+            "    %s --fixdecstates source.hps dest.hps\n"
             "\n",
-            bin_name, bin_name, bin_name);
+            bin_name, bin_name, bin_name, bin_name);
 
     exit(EXIT_FAILURE);
 }
@@ -96,6 +105,15 @@ int main(int argc, char **argv)
 
             mode = MODE_EXTRACT;
             hps_name = argv[++i];
+        }
+        else if (!strcmp("--fixdecstates", argv[i])){
+            if (mode != MODE_INVALID) usage();
+            if (i != 1) usage(); //option must be second argument
+            if (argc != 4) usage(); //command must contain source and dest filenames
+
+            mode = MODE_FIXDECSTATES;
+            hps_name = argv[++i];
+
         }
         else if (!strcmp("--build", argv[i]))
         {
@@ -137,6 +155,9 @@ int main(int argc, char **argv)
         case MODE_EXTRACT:
             extract(hps_name, dsp_names, dsp_count);
             break;
+        case MODE_FIXDECSTATES:
+            fixdecstates(hps_name, dsp_names, dsp_count);
+            break;
         case MODE_INVALID:
             usage();
             break;
@@ -144,7 +165,7 @@ int main(int argc, char **argv)
 
     return 0;
 }
-
+/*
 static void expect_8(uint8_t expected, long offset, const char *desc,
         FILE *infile)
 {
@@ -157,6 +178,7 @@ static void expect_8(uint8_t expected, long offset, const char *desc,
         exit(EXIT_FAILURE);
     }
 }
+*/
 static void expect_16(uint16_t expected, long offset, const char *desc,
         FILE *infile)
 {
@@ -181,14 +203,14 @@ static void expect_32(uint32_t expected, long offset, const char *desc,
         exit(EXIT_FAILURE);
     }
 }
-
+/*
 static uint32_t samples_to_nibbles(uint32_t samples)
 {
     uint32_t nibbles = samples / 14 * 16;
     if (samples % 14) nibbles += 2 + samples % 14;
     return nibbles;
 }
-
+*/
 static uint32_t nibbles_to_samples(uint32_t nibbles)
 {
     uint32_t whole_frames = nibbles / 16;
@@ -200,6 +222,175 @@ static uint32_t nibbles_to_samples(uint32_t nibbles)
 }
 
 static const uint8_t HALPST_sig[8] = {' ','H','A','L','P','S','T','\0'};
+
+
+
+static void fixdecstates(const char *brstm_name, const char *dsp_names [],
+        int dsp_count){
+
+   FILE *infile = NULL;
+   long infile_size;
+   FILE *outfile = NULL;;
+
+   int examine_mode = 1;
+
+   // open input file
+   infile = fopen(brstm_name, "rb");
+   CHECK_ERRNO(infile == NULL, "fopen of input file");
+
+   CHECK_ERRNO(fseek(infile, 0, SEEK_END) == -1, "fseek");
+   infile_size = ftell(infile);
+   CHECK_ERRNO(infile_size == -1, "ftell");
+
+   if (dsp_count != 1) usage();
+   else
+   {
+      outfile = fopen(dsp_names[0], "wb");
+      CHECK_ERRNO(outfile == NULL, "error opening output file");
+   }
+
+   uint32_t channel_count;
+   struct channel_info info[MAX_CHANNELS];
+
+   channel_count = get_32_be_seek(0x0C, infile);
+
+   // get the first histories in the HPS header, so that succeeding
+   // histories may be calculated in terms of them
+   for (int c = 0; c < channel_count; c++){
+      long info_offset = 0x10 + c * 0x38;
+
+      for (int i = 0; i < 16; i++){
+         info[c].state.coef[i] = get_16_be_seek(info_offset + 0x10 + i*2, // channel decoder coefficient
+            infile);
+      }
+      info[c].state.ps = get_16_be_seek(info_offset + 0x32, infile);
+      info[c].state.hist1 = get_16_be_seek(info_offset + 0x34, infile);
+      info[c].state.hist2 = get_16_be_seek(info_offset + 0x36, infile);
+   }
+
+
+   //copy the header to the output file
+   long output_offset = 0x00;
+   for (uint32_t i = 0; i < 0x80; i+= 0x01){
+      uint8_t outbyte = get_byte_seek(output_offset, infile);
+      put_byte(outbyte, outfile);
+
+      output_offset += 0x01;
+   }
+   fflush(outfile);
+
+
+   int blocks_processed = 0;
+
+   // process stream block-by-block
+   {
+      long last_block_offset = 0;
+      long block_offset = 0x80;
+      long nibbles_left = info[0].last_nibble+1;
+
+
+
+      for (;;)
+      {
+         const uint32_t block_size_total =
+            get_32_be_seek(block_offset + 0x00, infile);
+         const uint32_t block_size = block_size_total / channel_count;
+         const uint32_t block_nibbles =
+            get_32_be_seek(block_offset + 0x04, infile) + 1;
+
+         int loop_pass = 0;
+
+         // looped, one additional pass to check state at loop point
+         if (last_block_offset >= block_offset){
+            break;
+         }
+
+         nibbles_left -= block_nibbles;
+
+
+         // update state
+         for (int c = 0; c < channel_count; c++)
+         {
+            const long data_offset = block_offset + 0x20 + block_size*c;
+            info[c].state.ps = get_byte_seek(data_offset, infile);
+         }
+
+         uint16_t initial_ps_l = get_16_be_seek(block_offset + 0x20, infile);
+         //uint16_t initial_ps_r = get_16_be_seek(block_offset + 0x8020, infile);
+         uint16_t initial_ps_r = get_16_be_seek(block_offset + 0x20 +
+            block_size_total/channel_count, infile);
+
+         uint32_t nxt_block_offset = get_32_be_seek(block_offset + 0x08, infile);
+
+         initial_ps_l = initial_ps_l >> 8; // remove last 8 bits or 1 byte
+         initial_ps_r = initial_ps_r >> 8; // remove last 8 bits or 1 byte
+
+         uint16_t l_hist1 = info[0].state.hist1;
+         uint16_t l_hist2 = info[0].state.hist2;
+
+         uint16_t r_hist1 = info[1].state.hist1;
+         uint16_t r_hist2 = info[1].state.hist2;
+
+         // write the block header
+         put_32_be(block_size_total, outfile);
+         put_32_be(block_nibbles-1, outfile);
+         put_32_be(nxt_block_offset, outfile);
+         put_16_be(initial_ps_l, outfile);
+         put_16_be(l_hist1, outfile);
+
+         put_16_be(l_hist2, outfile);
+         put_16_be(0x0000, outfile);
+
+         put_16_be(initial_ps_r, outfile);
+         
+         put_16_be(r_hist1, outfile);
+         put_16_be(r_hist2, outfile);
+         put_16_be(0x0000, outfile);
+         put_32_be(0x00000000, outfile);
+         fflush(outfile);
+
+         
+
+         blocks_processed++;
+
+         // write the block data
+         print_block_data(block_offset, block_size_total, infile, outfile);
+
+         // decode to advance state
+         for (int c = 0; c < channel_count; c++)
+         {
+             const long data_offset = block_offset + 0x20 + block_size*c;
+             const uint32_t block_nibbles = block_size * 2;
+
+             decode_dsp_nowhere(&info[c].state, data_offset+1, 2, block_nibbles-1, infile);
+         }
+
+
+         // advance to next block
+         last_block_offset = block_offset;
+         block_offset = get_32_be_seek(block_offset + 0x08, infile);
+
+         // end, loop
+         if (loop_pass) break;
+         // end, no loop
+         if (block_offset == UINT32_C(0xFFFFFFFF)) break;
+      }
+    }
+
+    // close files
+    if (!examine_mode)
+    {
+         CHECK_ERRNO(fclose(outfile) != 0, "fclose");
+         outfile = NULL;
+    }
+    CHECK_ERRNO(fclose(infile) != 0, "fclose");
+    infile = NULL;
+
+    fflush(stderr);
+    fprintf(stdout, "Done with file \"%s\"\n", brstm_name);
+    fflush(stdout);
+}
+
 
 static void extract(const char *brstm_name, const char *dsp_names [],
         int dsp_count)
@@ -301,14 +492,32 @@ static void extract(const char *brstm_name, const char *dsp_names [],
         }
 
         /* check that remaining header space is zeroes */
+
+        // Vincent's Notes: This check makes no fucking sense and isn't even executed because
+        // at this point channel_count = 2 and MAX_CHANNELS is also 2, and there are no
+        // extra zeros in my HPS file.... but maybe other HPS files have this....
+
+
+        //printf("about to check that remaining header space is zeroes\n");
+        //printf("channel_count = %d, MAX_CHANNELS = %d\n", channel_count, MAX_CHANNELS);
+        //fflush(stdout);
+
         for (int c = channel_count; c < MAX_CHANNELS; c++)
         {
+
+            //printf("checking that remaining header space is zeros\n");
+            //fflush(stdout);
+
             long info_offset = 0x10 + c * 0x38;
             for (int i = 0; i < 0x38; i += 4)
             {
+               //printf("%lu <-- info_offset + %d", info_offset, i);
+               //fflush(stdout);
                 expect_32(0, info_offset + i, "zero padding in header", infile);
             }
         }
+        //printf("done: checking that remaining header space is zeros\n");
+        //fflush(stdout);
 
         /* TODO: print stream info */
 
@@ -322,7 +531,7 @@ static void extract(const char *brstm_name, const char *dsp_names [],
         }
     }
 
-    /* output initial info in DSP header */
+    /* output initial info in DSP header */        // <--------- left off here 3/20/16
     if (!examine_mode)
     {
         for (int c = 0; c < channel_count; c++)
@@ -370,7 +579,7 @@ static void extract(const char *brstm_name, const char *dsp_names [],
     }
 
     /* process stream block-by-block */
-    int loop_flag = 0;
+    //int loop_flag = 0;
     {
         long last_block_offset = 0;
         long block_offset = 0x80;
@@ -378,6 +587,10 @@ static void extract(const char *brstm_name, const char *dsp_names [],
 
         for (;;)
         {
+
+            //printf("block offset: %x\n", block_offset);
+            //fflush(stdout);
+
             const uint32_t block_size_total =
                 get_32_be_seek(block_offset + 0x00, infile);
             CHECK_ERROR(block_size_total % channel_count != 0,
@@ -421,6 +634,8 @@ static void extract(const char *brstm_name, const char *dsp_names [],
             /* update state, check for consistency */
             for (int c = 0; c < channel_count; c++)
             {
+
+
                 const long block_channel_offset = block_offset + 0x0C + 8*c;
                 const long data_offset = block_offset + 0x20 + block_size*c;
 
@@ -437,10 +652,31 @@ static void extract(const char *brstm_name, const char *dsp_names [],
                 info[c].state.ps = get_byte_seek(data_offset, infile);
                 CHECK_ERROR(info[c].state.ps != block_init_ps,
                         "block header init P/S != first P/S in block");
+
+                if (!loop_pass)
                 CHECK_ERROR(info[c].state.hist1 != block_init_hist1,
                         "history1 mismatch");
+                if (!loop_pass)
                 CHECK_ERROR(info[c].state.hist2 != block_init_hist2,
                         "history2 mismatch");
+
+                  /*
+                  printf("loop_pass = %d; c = %d; info[c].state.hist1 = 0x%x, block_init_hist1 = 0x%x\n", loop_pass, c, info[c].state.hist1, block_init_hist1);
+                  fflush(stdout);
+                  printf("loop_pass = %d; c = %d; info[c].state.hist2 = 0x%x, block_init_hist2 = 0x%x\n", loop_pass, c, info[c].state.hist2, block_init_hist2);
+                  fflush(stdout);
+
+                  if (info[c].state.hist1 != block_init_hist1){
+                     printf("block offset = 0x%x; channel count = %d; ", block_offset, channel_count);
+                     printf("c = %d; info[c].state.hist1 = 0x%x, block_init_hist1 = 0x%x\n", c, info[c].state.hist1, block_init_hist1);
+                     fflush(stdout);
+                  }
+                  if (info[c].state.hist2 != block_init_hist2){
+                     printf("block offset = 0x%x; channel count = %d; ", block_offset, channel_count);
+                     printf("c = %d; info[c].state.hist2 = 0x%x, block_init_hist2 = 0x%x\n", c, info[c].state.hist2, block_init_hist2);
+                     fflush(stdout);
+                  }
+                  */
             }
 
             /* check padding for missing channel */
@@ -474,8 +710,8 @@ static void extract(const char *brstm_name, const char *dsp_names [],
             if (block_offset == UINT32_C(0xFFFFFFFF)) break;
         }
 
-        if (block_offset == UINT32_C(0xFFFFFFFF)) loop_flag = 0;
-        else loop_flag = 1;
+        //if (block_offset == UINT32_C(0xFFFFFFFF)) loop_flag = 0;
+        //else loop_flag = 1;
     }
 
     /* close files */
@@ -491,6 +727,7 @@ static void extract(const char *brstm_name, const char *dsp_names [],
     infile = NULL;
 
     fprintf(stderr, "Done!\n");
+    fflush(stderr);
 }
 
 void build(const char *brstm_name, const char *dsp_names[],
@@ -854,11 +1091,22 @@ void decode_dsp_nowhere(struct DSP_decode_state *state, long start_offset, uint3
     int32_t coef1 = state->coef[coef_index*2+0];
     int32_t coef2 = state->coef[coef_index*2+1];
 
+    /*
+    printf("start_offset: %#x\n"
+           "start_nibble: %#x\n"
+           "end_nibble: %#x\n\n",
+
+           start_offset, start_nibble, end_nibble
+
+   );
+   */
     do 
     {
         //if (state->hist1 == -478 && state->hist2 == -2938) printf("offset=%lx current_nibble = %"PRIx32"\n",offset,current_nibble);
+
         if (0 == current_nibble % 16)
         {
+
             state->ps = get_byte_seek(offset, infile);
 
             scale = state->ps & 0xf;
@@ -873,6 +1121,7 @@ void decode_dsp_nowhere(struct DSP_decode_state *state, long start_offset, uint3
         {
             uint8_t byte = get_byte_seek(offset, infile);
             int32_t delta;
+
             if (current_nibble % 2 == 1) delta = byte & 0xf;
             else delta = (byte >> 4) & 0xf;
 
@@ -895,4 +1144,59 @@ void decode_dsp_nowhere(struct DSP_decode_state *state, long start_offset, uint3
         }
     }
     while (end_nibble >= current_nibble);
+}
+
+
+void print_block_data(long block_offset, uint32_t block_size_total, FILE *infile, FILE *outfile)
+{
+
+   //if (block_offset == 0x80) // test with block 1 first
+   //{
+
+      //fprintf(outfile, "this is block 1");
+
+   long current_offset = block_offset + 0x20;
+   uint32_t bytes_remaining = block_size_total;
+
+
+   /*
+   uint8_t byte = get_byte_seek(current_offset, infile);
+   uint8_t byte2 = get_byte_seek(current_offset + 0x01, infile);
+   uint8_t byte3 = get_byte_seek(current_offset + 0x02, infile);
+   uint8_t byte4 = get_byte_seek(current_offset + 0x03, infile);
+
+   printf("debug: bytes: %02x%02x%02x%02x\n", byte, byte2, byte3, byte4);
+   printf("block_size_total = %#x\n", block_size_total);
+   printf("block_size_total - 0x01 = %#x\n", block_size_total - 0x01);
+   printf("block_size_total - 0x01 - 0x01 = %#x\n", block_size_total - 0x02);
+   printf("block_size_total - 0x01 - 0x01 - 0x01= %#x\n", block_size_total - 0x03);
+   fflush(stdout);
+   */
+
+
+   uint8_t byte;
+   while (bytes_remaining > 0x00){
+      byte = get_byte_seek(current_offset, infile);
+      put_byte(byte, outfile);
+      //fflush(outfile);
+
+      /*
+      if (ftell(outfile) == 2426166) printf("2426166: %x", byte);
+      if (ftell(outfile) == 2491670) printf("2491670: %x", byte);
+      if (ftell(outfile) == 2622678) printf("2622678: %x", byte);
+      if (ftell(outfile) == 2688182) printf("2688182: %x", byte);
+      if (ftell(outfile) == 2753686) printf("2753686: %x", byte);
+      if (ftell(outfile) == 2819190) printf("2819190: %x", byte);
+      if (ftell(outfile) == 2884694) printf("2884694: %x", byte);
+      if (ftell(outfile) == 2950198) printf("2950198: %x", byte);
+      if (ftell(outfile) == 3015702) printf("3015702: %x", byte);
+      if (ftell(outfile) == 3081206) printf("3081206: %x", byte);
+      fflush(stdout);
+      */
+      
+      current_offset += 0x01;
+      bytes_remaining -= 0x01;
+   }
+   fflush(outfile);
+   //}
 }
